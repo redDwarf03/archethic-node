@@ -1,7 +1,7 @@
 defmodule Archethic.P2P.Message.ReplicatePendingTransactionChain do
   @moduledoc false
 
-  defstruct [:address, :genesis_address, :proof_of_validation]
+  defstruct [:address, :genesis_address, :proof_of_replication]
 
   use Retry
 
@@ -9,13 +9,12 @@ defmodule Archethic.P2P.Message.ReplicatePendingTransactionChain do
   alias Archethic.Election
   alias Archethic.P2P
   alias Archethic.P2P.Message.Ok
-  alias Archethic.P2P.Message.Error
   alias Archethic.P2P.Message.AcknowledgeStorage
   alias Archethic.Replication
 
   alias Archethic.TransactionChain
   alias Archethic.TransactionChain.Transaction
-  alias Archethic.TransactionChain.Transaction.ProofOfValidation
+  alias Archethic.TransactionChain.Transaction.ProofOfReplication
   alias Archethic.TransactionChain.Transaction.ValidationStamp
 
   alias Archethic.TransactionChain.Transaction.ValidationStamp.LedgerOperations.VersionedUnspentOutput
@@ -28,15 +27,15 @@ defmodule Archethic.P2P.Message.ReplicatePendingTransactionChain do
   @type t() :: %__MODULE__{
           address: Crypto.prepended_hash(),
           genesis_address: Crypto.prepended_hash(),
-          proof_of_validation: ProofOfValidation.t()
+          proof_of_replication: ProofOfReplication.t()
         }
 
-  @spec process(__MODULE__.t(), Crypto.key()) :: Ok.t() | Error.t()
+  @spec process(__MODULE__.t(), Crypto.key()) :: Ok.t()
   def process(
         %__MODULE__{
           address: address,
           genesis_address: genesis_address,
-          proof_of_validation: proof
+          proof_of_replication: proof
         },
         sender_public_key
       ) do
@@ -46,9 +45,10 @@ defmodule Archethic.P2P.Message.ReplicatePendingTransactionChain do
       with {:ok, tx, validation_inputs} <- get_transaction_data(address),
            authorized_nodes <- P2P.authorized_and_available_nodes(tx.validation_stamp.timestamp),
            true <- Election.chain_storage_node?(address, node_public_key, authorized_nodes),
-           elected_nodes <- ProofOfValidation.get_election(authorized_nodes, address),
-           true <- ProofOfValidation.valid?(elected_nodes, proof, tx.validation_stamp) do
-        tx = %Transaction{tx | proof_of_validation: proof}
+           elected_nodes <- ProofOfReplication.get_election(authorized_nodes, address),
+           tx_summary <- TransactionSummary.from_transaction(tx, genesis_address),
+           true <- ProofOfReplication.valid?(elected_nodes, proof, tx_summary) do
+        tx = %Transaction{tx | proof_of_replication: proof}
         replicate_transaction(tx, validation_inputs, genesis_address, sender_public_key)
       else
         _ -> :skip
@@ -69,7 +69,7 @@ defmodule Archethic.P2P.Message.ReplicatePendingTransactionChain do
 
   defp get_data_in_tx_pool(address) do
     retry_while with: constant_backoff(100) |> expiry(2000) do
-      case Replication.get_transaction_in_commit_pool(address) do
+      case Replication.pop_transaction_in_commit_pool(address) do
         {:ok, tx, validation_utxo} ->
           validation_inputs = convert_unspent_outputs_to_inputs(validation_utxo)
           {:halt, {:ok, tx, validation_inputs}}
@@ -86,7 +86,10 @@ defmodule Archethic.P2P.Message.ReplicatePendingTransactionChain do
     res =
       [
         Task.async(fn ->
-          TransactionChain.fetch_transaction(address, storage_nodes, search_mode: :remote)
+          TransactionChain.fetch_transaction(address, storage_nodes,
+            search_mode: :remote,
+            acceptance_resolver: :accept_transaction
+          )
         end),
         Task.async(fn -> TransactionChain.fetch_inputs(address, storage_nodes) end)
       ]
@@ -144,22 +147,22 @@ defmodule Archethic.P2P.Message.ReplicatePendingTransactionChain do
   def serialize(%__MODULE__{
         address: address,
         genesis_address: genesis_address,
-        proof_of_validation: proof
+        proof_of_replication: proof
       }) do
-    <<address::binary, genesis_address::binary, ProofOfValidation.serialize(proof)::bitstring>>
+    <<address::binary, genesis_address::binary, ProofOfReplication.serialize(proof)::bitstring>>
   end
 
   @spec deserialize(bitstring()) :: {t(), bitstring}
   def deserialize(bin) do
     {address, rest} = Utils.deserialize_address(bin)
     {genesis_address, rest} = Utils.deserialize_address(rest)
-    {proof, rest} = ProofOfValidation.deserialize(rest)
+    {proof, rest} = ProofOfReplication.deserialize(rest)
 
     {
       %__MODULE__{
         address: address,
         genesis_address: genesis_address,
-        proof_of_validation: proof
+        proof_of_replication: proof
       },
       rest
     }
